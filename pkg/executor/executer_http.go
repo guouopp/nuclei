@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,11 +24,12 @@ import (
 // HTTPExecutor is client for performing HTTP requests
 // for a template.
 type HTTPExecutor struct {
-	httpClient  *retryablehttp.Client
-	template    *templates.Template
-	httpRequest *requests.HTTPRequest
-	writer      *bufio.Writer
-	outputMutex *sync.Mutex
+	httpClient    *retryablehttp.Client
+	template      *templates.Template
+	httpRequest   *requests.HTTPRequest
+	writer        *bufio.Writer
+	outputMutex   *sync.Mutex
+	customHeaders requests.CustomHeaders
 }
 
 // HTTPOptions contains configuration options for the HTTP executor.
@@ -39,6 +41,7 @@ type HTTPOptions struct {
 	Retries       int
 	ProxyURL      string
 	ProxySocksURL string
+	CustomHeaders requests.CustomHeaders
 }
 
 // NewHTTPExecutor creates a new HTTP executor from a template
@@ -59,11 +62,12 @@ func NewHTTPExecutor(options *HTTPOptions) (*HTTPExecutor, error) {
 	client.CheckRetry = retryablehttp.HostSprayRetryPolicy()
 
 	executer := &HTTPExecutor{
-		httpClient:  client,
-		template:    options.Template,
-		httpRequest: options.HTTPRequest,
-		outputMutex: &sync.Mutex{},
-		writer:      options.Writer,
+		httpClient:    client,
+		template:      options.Template,
+		httpRequest:   options.HTTPRequest,
+		outputMutex:   &sync.Mutex{},
+		writer:        options.Writer,
+		customHeaders: options.CustomHeaders,
 	}
 	return executer, nil
 }
@@ -78,7 +82,12 @@ func (e *HTTPExecutor) ExecuteHTTP(URL string) error {
 
 	// Send the request to the target servers
 mainLoop:
-	for _, req := range compiledRequest {
+	for compiledRequest := range compiledRequest {
+		if compiledRequest.Error != nil {
+			return errors.Wrap(err, "could not make http request")
+		}
+		e.setCustomHeaders(compiledRequest)
+		req := compiledRequest.Request
 		resp, err := e.httpClient.Do(req)
 		if err != nil {
 			if resp != nil {
@@ -94,6 +103,13 @@ mainLoop:
 			return errors.Wrap(err, "could not read http body")
 		}
 		resp.Body.Close()
+
+		// net/http doesn't automatically decompress the response body if an encoding has been specified by the user in the request
+		// so in case we have to manually do it
+		data, err = requests.HandleDecompression(compiledRequest.Request, data)
+		if err != nil {
+			return errors.Wrap(err, "could not decompress http body")
+		}
 
 		// Convert response body from []byte to string with zero copy
 		body := unsafeToString(data)
@@ -117,7 +133,7 @@ mainLoop:
 				// If the matcher has matched, and its an OR
 				// write the first output then move to next matcher.
 				if matcherCondition == matchers.ORCondition && len(e.httpRequest.Extractors) == 0 {
-					e.writeOutputHTTP(req, matcher, nil)
+					e.writeOutputHTTP(compiledRequest, matcher, nil)
 				}
 			}
 		}
@@ -138,7 +154,7 @@ mainLoop:
 		// Write a final string of output if matcher type is
 		// AND or if we have extractors for the mechanism too.
 		if len(e.httpRequest.Extractors) > 0 || matcherCondition == matchers.ANDCondition {
-			e.writeOutputHTTP(req, nil, extractorResults)
+			e.writeOutputHTTP(compiledRequest, nil, extractorResults)
 		}
 	}
 	return nil
@@ -210,5 +226,21 @@ func makeCheckRedirectFunc(followRedirects bool, maxRedirects int) checkRedirect
 			return http.ErrUseLastResponse
 		}
 		return nil
+	}
+}
+
+func (e *HTTPExecutor) setCustomHeaders(r *requests.CompiledHTTP) {
+	for _, customHeader := range e.customHeaders {
+		// This should be pre-computed somewhere and done only once
+		tokens := strings.Split(customHeader, ":")
+		// if it's an invalid header skip it
+		if len(tokens) < 2 {
+			continue
+		}
+
+		headerName, headerValue := tokens[0], strings.Join(tokens[1:], "")
+		headerName = strings.TrimSpace(headerName)
+		headerValue = strings.TrimSpace(headerValue)
+		r.Request.Header.Set(headerName, headerValue)
 	}
 }
