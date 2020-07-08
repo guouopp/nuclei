@@ -7,16 +7,19 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/projectdiscovery/nuclei/pkg/extractors"
-	"github.com/projectdiscovery/nuclei/pkg/matchers"
-	"github.com/projectdiscovery/nuclei/pkg/requests"
-	"github.com/projectdiscovery/nuclei/pkg/templates"
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v2/pkg/matchers"
+	"github.com/projectdiscovery/nuclei/v2/pkg/requests"
+	"github.com/projectdiscovery/nuclei/v2/pkg/templates"
 	"github.com/projectdiscovery/retryablehttp-go"
 	"golang.org/x/net/proxy"
 )
@@ -24,6 +27,9 @@ import (
 // HTTPExecutor is client for performing HTTP requests
 // for a template.
 type HTTPExecutor struct {
+	debug         bool
+	results       uint32
+	jsonOutput    bool
 	httpClient    *retryablehttp.Client
 	template      *templates.Template
 	httpRequest   *requests.HTTPRequest
@@ -41,6 +47,8 @@ type HTTPOptions struct {
 	Retries       int
 	ProxyURL      string
 	ProxySocksURL string
+	Debug         bool
+	JSON          bool
 	CustomHeaders requests.CustomHeaders
 }
 
@@ -62,6 +70,9 @@ func NewHTTPExecutor(options *HTTPOptions) (*HTTPExecutor, error) {
 	client.CheckRetry = retryablehttp.HostSprayRetryPolicy()
 
 	executer := &HTTPExecutor{
+		debug:         options.Debug,
+		jsonOutput:    options.JSON,
+		results:       0,
 		httpClient:    client,
 		template:      options.Template,
 		httpRequest:   options.HTTPRequest,
@@ -70,6 +81,14 @@ func NewHTTPExecutor(options *HTTPOptions) (*HTTPExecutor, error) {
 		customHeaders: options.CustomHeaders,
 	}
 	return executer, nil
+}
+
+// GotResults returns true if there were any results for the executor
+func (e *HTTPExecutor) GotResults() bool {
+	if atomic.LoadUint32(&e.results) == 0 {
+		return false
+	}
+	return true
 }
 
 // ExecuteHTTP executes the HTTP request on a URL
@@ -88,12 +107,32 @@ mainLoop:
 		}
 		e.setCustomHeaders(compiledRequest)
 		req := compiledRequest.Request
+
+		if e.debug {
+			gologger.Infof("Dumped HTTP request for %s (%s)\n\n", URL, e.template.ID)
+			dumpedRequest, err := httputil.DumpRequest(req.Request, true)
+			if err != nil {
+				return errors.Wrap(err, "could not dump http request")
+			}
+			fmt.Fprintf(os.Stderr, "%s", string(dumpedRequest))
+		}
+
 		resp, err := e.httpClient.Do(req)
 		if err != nil {
 			if resp != nil {
 				resp.Body.Close()
 			}
-			return errors.Wrap(err, "could not make http request")
+			gologger.Warningf("Could not do request: %s\n", err)
+			continue
+		}
+
+		if e.debug {
+			gologger.Infof("Dumped HTTP response for %s (%s)\n\n", URL, e.template.ID)
+			dumpedResponse, err := httputil.DumpResponse(resp, true)
+			if err != nil {
+				return errors.Wrap(err, "could not dump http response")
+			}
+			fmt.Fprintf(os.Stderr, "%s\n", string(dumpedResponse))
 		}
 
 		data, err := ioutil.ReadAll(resp.Body)
@@ -117,12 +156,7 @@ mainLoop:
 		var headers string
 		matcherCondition := e.httpRequest.GetMatchersCondition()
 		for _, matcher := range e.httpRequest.Matchers {
-			// Only build the headers string if the matcher asks for it
-			part := matcher.GetPart()
-			if part == matchers.AllPart || part == matchers.HeaderPart && headers == "" {
-				headers = headersToString(resp.Header)
-			}
-
+			headers = headersToString(resp.Header)
 			// Check if the matcher matched
 			if !matcher.Match(resp, body, headers) {
 				// If the condition is AND we haven't matched, try next request.
@@ -134,6 +168,7 @@ mainLoop:
 				// write the first output then move to next matcher.
 				if matcherCondition == matchers.ORCondition && len(e.httpRequest.Extractors) == 0 {
 					e.writeOutputHTTP(compiledRequest, matcher, nil)
+					atomic.CompareAndSwapUint32(&e.results, 0, 1)
 				}
 			}
 		}
@@ -142,10 +177,7 @@ mainLoop:
 		// next task which is extraction of input from matchers.
 		var extractorResults []string
 		for _, extractor := range e.httpRequest.Extractors {
-			part := extractor.GetPart()
-			if part == extractors.AllPart || part == extractors.HeaderPart && headers == "" {
-				headers = headersToString(resp.Header)
-			}
+			headers = headersToString(resp.Header)
 			for match := range extractor.Extract(body, headers) {
 				extractorResults = append(extractorResults, match)
 			}
@@ -155,8 +187,12 @@ mainLoop:
 		// AND or if we have extractors for the mechanism too.
 		if len(e.httpRequest.Extractors) > 0 || matcherCondition == matchers.ANDCondition {
 			e.writeOutputHTTP(compiledRequest, nil, extractorResults)
+			atomic.CompareAndSwapUint32(&e.results, 0, 1)
 		}
 	}
+
+	gologger.Verbosef("Sent HTTP request to %s\n", "http-request", URL)
+
 	return nil
 }
 

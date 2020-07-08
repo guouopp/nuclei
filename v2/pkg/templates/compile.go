@@ -1,16 +1,17 @@
 package templates
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
-	"github.com/projectdiscovery/nuclei/pkg/generators"
-	"github.com/projectdiscovery/nuclei/pkg/matchers"
+	"github.com/projectdiscovery/nuclei/v2/pkg/generators"
+	"github.com/projectdiscovery/nuclei/v2/pkg/matchers"
 	"gopkg.in/yaml.v2"
 )
 
-// ParseTemplate parses a yaml request template file
-func ParseTemplate(file string) (*Template, error) {
+// Parse parses a yaml request template file
+func Parse(file string) (*Template, error) {
 	template := &Template{}
 
 	f, err := os.Open(file)
@@ -20,17 +21,21 @@ func ParseTemplate(file string) (*Template, error) {
 
 	err = yaml.NewDecoder(f).Decode(template)
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
-	f.Close()
+	defer f.Close()
+
+	// If no requests, and it is also not a workflow, return error.
+	if len(template.RequestsHTTP)+len(template.RequestsDNS) <= 0 {
+		return nil, errors.New("No requests defined")
+	}
 
 	// Compile the matchers and the extractors for http requests
 	for _, request := range template.RequestsHTTP {
 		// Get the condition between the matchers
 		condition, ok := matchers.ConditionTypes[request.MatchersCondition]
 		if !ok {
-			request.SetMatchersCondition(matchers.ANDCondition)
+			request.SetMatchersCondition(matchers.ORCondition)
 		} else {
 			request.SetMatchersCondition(condition)
 		}
@@ -68,7 +73,7 @@ func ParseTemplate(file string) (*Template, error) {
 		// Get the condition between the matchers
 		condition, ok := matchers.ConditionTypes[request.MatchersCondition]
 		if !ok {
-			request.SetMatchersCondition(matchers.ANDCondition)
+			request.SetMatchersCondition(matchers.ORCondition)
 		} else {
 			request.SetMatchersCondition(condition)
 		}
