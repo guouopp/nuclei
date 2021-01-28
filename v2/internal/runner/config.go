@@ -27,7 +27,7 @@ const nucleiConfigFilename = ".nuclei-config.json"
 var reVersion = regexp.MustCompile(`\d+\.\d+\.\d+`)
 
 // readConfiguration reads the nuclei configuration file from disk.
-func (r *Runner) readConfiguration() (*nucleiConfig, error) {
+func readConfiguration() (*nucleiConfig, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
@@ -35,27 +35,22 @@ func (r *Runner) readConfiguration() (*nucleiConfig, error) {
 
 	templatesConfigFile := path.Join(home, nucleiConfigFilename)
 	file, err := os.Open(templatesConfigFile)
-
 	if err != nil {
 		return nil, err
 	}
-
 	defer file.Close()
 
 	config := &nucleiConfig{}
 	err = jsoniter.NewDecoder(file).Decode(config)
-
 	if err != nil {
 		return nil, err
 	}
-
 	return config, nil
 }
 
 // readConfiguration reads the nuclei configuration file from disk.
 func (r *Runner) writeConfiguration(config *nucleiConfig) error {
 	home, err := os.UserHomeDir()
-
 	if err != nil {
 		return err
 	}
@@ -63,18 +58,15 @@ func (r *Runner) writeConfiguration(config *nucleiConfig) error {
 	config.LastChecked = time.Now()
 	templatesConfigFile := path.Join(home, nucleiConfigFilename)
 	file, err := os.OpenFile(templatesConfigFile, os.O_WRONLY|os.O_CREATE, 0777)
-
 	if err != nil {
 		return err
 	}
-
 	defer file.Close()
 
 	err = jsoniter.NewEncoder(file).Encode(config)
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -82,7 +74,7 @@ const nucleiIgnoreFile = ".nuclei-ignore"
 
 // readNucleiIgnoreFile reads the nuclei ignore file marking it in map
 func (r *Runner) readNucleiIgnoreFile() {
-	file, err := os.Open(path.Join(r.templatesConfig.TemplatesDirectory, nucleiIgnoreFile))
+	file, err := os.Open(r.getIgnoreFilePath())
 	if err != nil {
 		return
 	}
@@ -94,7 +86,9 @@ func (r *Runner) readNucleiIgnoreFile() {
 		if text == "" {
 			continue
 		}
-
+		if strings.HasPrefix(text, "#") {
+			continue
+		}
 		r.templatesConfig.IgnorePaths = append(r.templatesConfig.IgnorePaths, text)
 	}
 }
@@ -121,4 +115,22 @@ func (r *Runner) checkIfInNucleiIgnore(item string) bool {
 	}
 
 	return false
+}
+
+func (r *Runner) getIgnoreFilePath() string {
+	defIgnoreFilePath := path.Join(r.templatesConfig.TemplatesDirectory, nucleiIgnoreFile)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return defIgnoreFilePath
+	}
+
+	cwdIgnoreFilePath := path.Join(cwd, nucleiIgnoreFile)
+
+	cwdIfpInfo, err := os.Stat(cwdIgnoreFilePath)
+	if os.IsNotExist(err) || cwdIfpInfo.IsDir() {
+		return defIgnoreFilePath
+	}
+
+	return cwdIgnoreFilePath
 }

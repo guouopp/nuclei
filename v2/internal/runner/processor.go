@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net/http/cookiejar"
@@ -9,7 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
 	tengo "github.com/d5/tengo/v2"
 	"github.com/d5/tengo/v2/stdlib"
@@ -21,6 +20,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/requests"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v2/pkg/workflows"
+	"github.com/remeh/sizedwaitgroup"
 )
 
 // workflowTemplates contains the initialized workflow templates per template group
@@ -29,8 +29,10 @@ type workflowTemplates struct {
 	Templates []*workflows.Template
 }
 
+var sandboxedModules = []string{"math", "text", "rand", "fmt", "json", "base64", "hex", "enum"}
+
 // processTemplateWithList processes a template and runs the enumeration on all the targets
-func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgress, template *templates.Template, request interface{}) bool {
+func (r *Runner) processTemplateWithList(p *progress.Progress, template *templates.Template, request interface{}) bool {
 	var httpExecuter *executer.HTTPExecuter
 	var dnsExecuter *executer.DNSExecuter
 	var err error
@@ -39,33 +41,43 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 	switch value := request.(type) {
 	case *requests.DNSRequest:
 		dnsExecuter = executer.NewDNSExecuter(&executer.DNSOptions{
+			TraceLog:      r.traceLog,
 			Debug:         r.options.Debug,
 			Template:      template,
 			DNSRequest:    value,
 			Writer:        r.output,
 			JSON:          r.options.JSON,
 			JSONRequests:  r.options.JSONRequests,
+			NoMeta:        r.options.NoMeta,
 			ColoredOutput: !r.options.NoColor,
 			Colorizer:     r.colorizer,
 			Decolorizer:   r.decolorizer,
+			RateLimiter:   r.ratelimiter,
 		})
 	case *requests.BulkHTTPRequest:
 		httpExecuter, err = executer.NewHTTPExecuter(&executer.HTTPOptions{
-			Debug:           r.options.Debug,
-			Template:        template,
-			BulkHTTPRequest: value,
-			Writer:          r.output,
-			Timeout:         r.options.Timeout,
-			Retries:         r.options.Retries,
-			ProxyURL:        r.options.ProxyURL,
-			ProxySocksURL:   r.options.ProxySocksURL,
-			CustomHeaders:   r.options.CustomHeaders,
-			JSON:            r.options.JSON,
-			JSONRequests:    r.options.JSONRequests,
-			CookieReuse:     value.CookieReuse,
-			ColoredOutput:   !r.options.NoColor,
-			Colorizer:       &r.colorizer,
-			Decolorizer:     r.decolorizer,
+			TraceLog:         r.traceLog,
+			Debug:            r.options.Debug,
+			Template:         template,
+			BulkHTTPRequest:  value,
+			Writer:           r.output,
+			Timeout:          r.options.Timeout,
+			Retries:          r.options.Retries,
+			ProxyURL:         r.options.ProxyURL,
+			ProxySocksURL:    r.options.ProxySocksURL,
+			RandomAgent:      r.options.RandomAgent,
+			CustomHeaders:    r.options.CustomHeaders,
+			JSON:             r.options.JSON,
+			JSONRequests:     r.options.JSONRequests,
+			NoMeta:           r.options.NoMeta,
+			CookieReuse:      value.CookieReuse,
+			ColoredOutput:    !r.options.NoColor,
+			Colorizer:        &r.colorizer,
+			Decolorizer:      r.decolorizer,
+			StopAtFirstMatch: r.options.StopAtFirstMatch,
+			PF:               r.pf,
+			Dialer:           r.dialer,
+			RateLimiter:      r.ratelimiter,
 		})
 	}
 
@@ -78,23 +90,18 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 
 	var globalresult atomicboolean.AtomBool
 
-	var wg sync.WaitGroup
+	wg := sizedwaitgroup.New(r.options.BulkSize)
 
-	scanner := bufio.NewScanner(strings.NewReader(r.input))
-	for scanner.Scan() {
-		text := scanner.Text()
-
-		r.limiter <- struct{}{}
-
-		wg.Add(1)
-
+	r.hm.Scan(func(k, _ []byte) error {
+		URL := string(k)
+		wg.Add()
 		go func(URL string) {
 			defer wg.Done()
 
-			var result executer.Result
+			var result *executer.Result
 
 			if httpExecuter != nil {
-				result = httpExecuter.ExecuteHTTP(ctx, p, URL)
+				result = httpExecuter.ExecuteHTTP(p, URL)
 				globalresult.Or(result.GotResults)
 			}
 
@@ -106,10 +113,10 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 			if result.Error != nil {
 				gologger.Warningf("[%s] Could not execute step: %s\n", r.colorizer.Colorizer.BrightBlue(template.ID), result.Error)
 			}
+		}(URL)
 
-			<-r.limiter
-		}(text)
-	}
+		return nil
+	})
 
 	wg.Wait()
 
@@ -118,48 +125,47 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 }
 
 // ProcessWorkflowWithList coming from stdin or list of targets
-func (r *Runner) processWorkflowWithList(p progress.IProgress, workflow *workflows.Workflow) bool {
+func (r *Runner) processWorkflowWithList(p *progress.Progress, workflow *workflows.Workflow) bool {
 	result := false
 
 	workflowTemplatesList, err := r.preloadWorkflowTemplates(p, workflow)
 	if err != nil {
 		gologger.Warningf("Could not preload templates for workflow %s: %s\n", workflow.ID, err)
-
-		return result
+		return false
 	}
-
 	logicBytes := []byte(workflow.Logic)
 
-	var wg sync.WaitGroup
-
-	scanner := bufio.NewScanner(strings.NewReader(r.input))
-	for scanner.Scan() {
-		targetURL := scanner.Text()
-		r.limiter <- struct{}{}
-
-		wg.Add(1)
+	wg := sizedwaitgroup.New(r.options.BulkSize)
+	r.hm.Scan(func(k, _ []byte) error {
+		targetURL := string(k)
+		wg.Add()
 
 		go func(targetURL string) {
 			defer wg.Done()
 
 			script := tengo.NewScript(logicBytes)
-			script.SetImports(stdlib.GetModuleMap(stdlib.AllModuleNames()...))
+			if !r.options.Sandbox {
+				script.SetImports(stdlib.GetModuleMap(stdlib.AllModuleNames()...))
+			} else {
+				script.SetImports(stdlib.GetModuleMap(sandboxedModules...))
+			}
 
 			variables := make(map[string]*workflows.NucleiVar)
-
 			for _, workflowTemplate := range *workflowTemplatesList {
 				name := workflowTemplate.Name
 				variable := &workflows.NucleiVar{Templates: workflowTemplate.Templates, URL: targetURL}
 				err := script.Add(name, variable)
 				if err != nil {
 					gologger.Errorf("Could not initialize script for workflow '%s': %s\n", workflow.ID, err)
-
 					continue
 				}
 				variables[name] = variable
 			}
 
-			_, err := script.RunContext(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.options.MaxWorkflowDuration)*time.Minute)
+			defer cancel()
+
+			_, err := script.RunContext(ctx)
 			if err != nil {
 				gologger.Errorf("Could not execute workflow '%s': %s\n", workflow.ID, err)
 			}
@@ -170,23 +176,21 @@ func (r *Runner) processWorkflowWithList(p progress.IProgress, workflow *workflo
 					break
 				}
 			}
-
-			<-r.limiter
 		}(targetURL)
-	}
+		return nil
+	})
 
 	wg.Wait()
 
 	return result
 }
 
-func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workflows.Workflow) (*[]workflowTemplates, error) {
+func (r *Runner) preloadWorkflowTemplates(p *progress.Progress, workflow *workflows.Workflow) (*[]workflowTemplates, error) {
 	var jar *cookiejar.Jar
 
 	if workflow.CookieReuse {
 		var err error
 		jar, err = cookiejar.New(nil)
-
 		if err != nil {
 			return nil, err
 		}
@@ -221,23 +225,31 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 			template := &workflows.Template{Progress: p}
 			if len(t.BulkRequestsHTTP) > 0 {
 				template.HTTPOptions = &executer.HTTPOptions{
-					Debug:         r.options.Debug,
-					Writer:        r.output,
-					Template:      t,
-					Timeout:       r.options.Timeout,
-					Retries:       r.options.Retries,
-					ProxyURL:      r.options.ProxyURL,
-					ProxySocksURL: r.options.ProxySocksURL,
-					CustomHeaders: r.options.CustomHeaders,
-					JSON:          r.options.JSON,
-					JSONRequests:  r.options.JSONRequests,
-					CookieJar:     jar,
-					ColoredOutput: !r.options.NoColor,
-					Colorizer:     &r.colorizer,
-					Decolorizer:   r.decolorizer,
+					TraceLog:         r.traceLog,
+					Debug:            r.options.Debug,
+					Writer:           r.output,
+					Template:         t,
+					Timeout:          r.options.Timeout,
+					Retries:          r.options.Retries,
+					ProxyURL:         r.options.ProxyURL,
+					ProxySocksURL:    r.options.ProxySocksURL,
+					RandomAgent:      r.options.RandomAgent,
+					CustomHeaders:    r.options.CustomHeaders,
+					JSON:             r.options.JSON,
+					JSONRequests:     r.options.JSONRequests,
+					CookieJar:        jar,
+					ColoredOutput:    !r.options.NoColor,
+					Colorizer:        &r.colorizer,
+					Decolorizer:      r.decolorizer,
+					PF:               r.pf,
+					RateLimiter:      r.ratelimiter,
+					NoMeta:           r.options.NoMeta,
+					StopAtFirstMatch: r.options.StopAtFirstMatch,
+					Dialer:           r.dialer,
 				}
 			} else if len(t.RequestsDNS) > 0 {
 				template.DNSOptions = &executer.DNSOptions{
+					TraceLog:      r.traceLog,
 					Debug:         r.options.Debug,
 					Template:      t,
 					Writer:        r.output,
@@ -246,6 +258,8 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 					ColoredOutput: !r.options.NoColor,
 					Colorizer:     r.colorizer,
 					Decolorizer:   r.decolorizer,
+					NoMeta:        r.options.NoMeta,
+					RateLimiter:   r.ratelimiter,
 				}
 			}
 
@@ -293,14 +307,17 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 						Retries:       r.options.Retries,
 						ProxyURL:      r.options.ProxyURL,
 						ProxySocksURL: r.options.ProxySocksURL,
+						RandomAgent:   r.options.RandomAgent,
 						CustomHeaders: r.options.CustomHeaders,
 						CookieJar:     jar,
+						TraceLog:      r.traceLog,
 					}
 				} else if len(t.RequestsDNS) > 0 {
 					template.DNSOptions = &executer.DNSOptions{
 						Debug:    r.options.Debug,
 						Template: t,
 						Writer:   r.output,
+						TraceLog: r.traceLog,
 					}
 				}
 				if template.DNSOptions != nil || template.HTTPOptions != nil {
@@ -308,7 +325,6 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 				}
 			}
 		}
-
 		wflTemplatesList = append(wflTemplatesList, workflowTemplates{Name: name, Templates: wtlst})
 	}
 
